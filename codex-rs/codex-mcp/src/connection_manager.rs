@@ -6,9 +6,11 @@
 //! calls to the right client, and exposes the public manager API used by
 //! `codex-core`.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -25,6 +27,7 @@ use crate::mcp::ToolPluginProvenance;
 use crate::rmcp_client::AsyncManagedClient;
 use crate::rmcp_client::CODEX_APPS_REFRESH_DURATION_METRIC;
 use crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT;
+use crate::rmcp_client::ListedToolsFetch;
 use crate::rmcp_client::MCP_TOOLS_LIST_DURATION_METRIC;
 use crate::rmcp_client::ManagedClient;
 use crate::rmcp_client::StartupOutcomeError;
@@ -33,6 +36,8 @@ use crate::runtime::McpRuntimeContext;
 use crate::runtime::emit_duration;
 use crate::server::EffectiveMcpServer;
 use crate::server::McpServerMetadata;
+use crate::tool_search_diagnostics::ToolSearchMcpDiagnosticsSnapshot;
+use crate::tool_search_diagnostics::ToolSearchToolsListResponseSnapshot;
 use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
 use crate::tools::normalize_tools_for_model_with_prefix;
@@ -118,6 +123,7 @@ pub struct McpConnectionManager {
     prefix_mcp_tool_names: bool,
     elicitation_requests: ElicitationRequestManager,
     startup_cancellation_token: CancellationToken,
+    latest_tools_list_responses: Mutex<BTreeMap<String, ToolSearchToolsListResponseSnapshot>>,
 }
 
 impl McpConnectionManager {
@@ -275,6 +281,7 @@ impl McpConnectionManager {
             prefix_mcp_tool_names,
             elicitation_requests: elicitation_requests.clone(),
             startup_cancellation_token: startup_cancellation_token.clone(),
+            latest_tools_list_responses: Mutex::new(BTreeMap::new()),
         };
         tokio::spawn(async move {
             let outcomes = join_set.join_all().await;
@@ -366,6 +373,7 @@ impl McpConnectionManager {
                 ElicitationRequestRouter::default(),
             ),
             startup_cancellation_token: CancellationToken::new(),
+            latest_tools_list_responses: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -485,20 +493,33 @@ impl McpConnectionManager {
     /// Returns all tools with model-visible names normalized.
     #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.clients.len()))]
     pub async fn list_all_tools(&self) -> Vec<ToolInfo> {
+        self.list_all_tools_with_diagnostics().await.0
+    }
+
+    /// Returns normalized tools plus compact MCP inputs for thread-scoped feedback diagnostics.
+    #[doc(hidden)]
+    pub async fn list_all_tools_with_diagnostics(
+        &self,
+    ) -> (Vec<ToolInfo>, ToolSearchMcpDiagnosticsSnapshot) {
         let mut tools = Vec::new();
+        let mut cached_server_count = 0;
+        let mut startup_complete_server_count = 0;
+        let mut fallback_responses = BTreeMap::new();
         for (server_name, managed_client) in &self.clients {
             managed_client.reconnect_failed_startup().await;
             let has_cached_tools = managed_client.has_cached_tools();
             let startup_complete = managed_client
                 .startup_complete
                 .load(std::sync::atomic::Ordering::Acquire);
+            cached_server_count += usize::from(has_cached_tools);
+            startup_complete_server_count += usize::from(startup_complete);
             trace!(
                 server_name = %server_name,
                 has_cached_tools,
                 startup_complete,
                 "waiting for MCP server tools while building tool list"
             );
-            let Some(server_tools) = managed_client
+            let Some((server_tools, response)) = managed_client
                 .listed_tools()
                 .instrument(trace_span!(
                     "list_tools_for_server",
@@ -508,8 +529,23 @@ impl McpConnectionManager {
                 ))
                 .await
             else {
+                fallback_responses.insert(
+                    server_name.clone(),
+                    ToolSearchToolsListResponseSnapshot::not_observed(server_name),
+                );
                 continue;
             };
+            if let Some(response) = response {
+                self.observe_tools_list_response(response);
+            } else {
+                fallback_responses.insert(
+                    server_name.clone(),
+                    ToolSearchToolsListResponseSnapshot::from_cached_tools(
+                        server_name,
+                        &server_tools,
+                    ),
+                );
+            }
             trace!(
                 server_name = %server_name,
                 tool_count = server_tools.len(),
@@ -521,7 +557,42 @@ impl McpConnectionManager {
                     .map(|tool| self.with_server_metadata(tool)),
             );
         }
-        normalize_tools_for_model_with_prefix(tools, self.prefix_mcp_tool_names)
+        let tools = normalize_tools_for_model_with_prefix(tools, self.prefix_mcp_tool_names);
+        let diagnostics = self.mcp_diagnostics_snapshot(
+            fallback_responses,
+            cached_server_count,
+            startup_complete_server_count,
+        );
+        (tools, diagnostics)
+    }
+
+    fn observe_tools_list_response(&self, response: ToolSearchToolsListResponseSnapshot) {
+        let mut responses = match self.latest_tools_list_responses.lock() {
+            Ok(responses) => responses,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        responses.insert(response.server_name.clone(), response);
+    }
+
+    fn mcp_diagnostics_snapshot(
+        &self,
+        mut fallback_responses: BTreeMap<String, ToolSearchToolsListResponseSnapshot>,
+        cached_server_count: usize,
+        startup_complete_server_count: usize,
+    ) -> ToolSearchMcpDiagnosticsSnapshot {
+        let responses = match self.latest_tools_list_responses.lock() {
+            Ok(responses) => responses,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for (server_name, response) in responses.iter() {
+            fallback_responses.insert(server_name.clone(), response.clone());
+        }
+        ToolSearchMcpDiagnosticsSnapshot {
+            tools_list_responses: fallback_responses.into_values().collect(),
+            server_count: self.clients.len(),
+            cached_server_count,
+            startup_complete_server_count,
+        }
     }
 
     /// Force-refresh codex apps tools by bypassing the in-process cache.
@@ -544,7 +615,7 @@ impl McpConnectionManager {
             .codex_apps_tools_cache_context
             .as_ref()
             .map(|cache_context| cache_context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh));
-        let tools = list_tools_for_client_uncached(
+        let ListedToolsFetch { tools, diagnostics } = list_tools_for_client_uncached(
             CODEX_APPS_MCP_SERVER_NAME,
             /*is_codex_apps_mcp_server*/ true,
             /*codex_apps_refresh_trigger*/ "explicit",
@@ -556,6 +627,7 @@ impl McpConnectionManager {
         .with_context(|| {
             format!("failed to refresh tools for MCP server '{CODEX_APPS_MCP_SERVER_NAME}'")
         })?;
+        self.observe_tools_list_response(diagnostics);
 
         let tools =
             match (
