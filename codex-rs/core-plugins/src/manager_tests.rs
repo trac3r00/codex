@@ -1886,6 +1886,56 @@ async fn load_plugins_uses_manifest_configured_component_paths() {
 }
 
 #[tokio::test]
+async fn load_plugins_includes_migrated_command_skills_with_explicit_skill_paths() {
+    let codex_home = TempDir::new().unwrap();
+    let source_root = codex_home.path().join("source/sample");
+
+    write_file(
+        &source_root.join(".codex-plugin/plugin.json"),
+        r#"{
+  "name": "sample",
+  "skills": "./custom-skills/"
+}"#,
+    );
+    fs::create_dir_all(source_root.join("custom-skills")).unwrap();
+    write_file(
+        &source_root.join("commands/pr/review.md"),
+        "---\ndescription: Review a pull request\n---\nInspect the proposed changes.\n",
+    );
+    let result = PluginStore::new(codex_home.path().to_path_buf())
+        .install(
+            source_root.abs(),
+            PluginId::parse("sample@test").expect("plugin id should parse"),
+        )
+        .unwrap();
+    let migrated_skill = result
+        .installed_path
+        .join(".codex-plugin/migrated-command-skills/source-command-pr-review/SKILL.md");
+    assert_eq!(
+        fs::read_to_string(migrated_skill).unwrap(),
+        "---\nname: \"source-command-pr-review\"\ndescription: \"Review a pull request\"\n---\n\n# source-command-pr-review\n\nUse this skill when the user asks to run the migrated source command `pr-review`.\n\n## Command Template\n\nInspect the proposed changes.\n"
+    );
+
+    let outcome = load_plugins_from_config(
+        &plugin_config_toml(/*enabled*/ true, /*plugins_feature_enabled*/ true),
+        codex_home.path(),
+        Some(AuthMode::Chatgpt),
+    )
+    .await;
+
+    assert_eq!(
+        outcome.plugins()[0].skill_roots,
+        vec![
+            result
+                .installed_path
+                .join(".codex-plugin/migrated-command-skills"),
+            result.installed_path.join("custom-skills"),
+        ]
+    );
+    assert!(outcome.plugins()[0].has_enabled_skills);
+}
+
+#[tokio::test]
 async fn load_plugin_skills_dedupes_overlapping_manifest_roots() {
     let codex_home = TempDir::new().unwrap();
     let plugin_root = codex_home
