@@ -1,4 +1,6 @@
-load("//:defs.bzl", "codex_rust_crate")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("//:defs.bzl", "codex_rust_crate", "workspace_root_test")
 
 codex_rust_crate(
     name = "app-server",
@@ -23,4 +25,48 @@ codex_rust_crate(
         "app-server-unit-tests": 8,
     },
     test_tags = ["no-sandbox"],
+)
+
+rust_binary(
+    name = "cold-skill-load-bench-bin",
+    testonly = True,
+    srcs = ["benches/cold_skill_load.rs"],
+    crate_name = "cold_skill_load_bench",
+    crate_root = "benches/cold_skill_load.rs",
+    data = [
+        ":codex-app-server",
+        "//codex-rs/exec-server/testing:exec-server",
+    ],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [
+        ":app-server",
+        "@crates//:divan",
+    ],
+)
+
+workspace_root_test(
+    name = "cold-skill-load-bench",
+    args = [
+        "--bench",
+        "cold_skill_load",
+    ],
+    data = [
+        ":codex-app-server",
+        "//codex-rs/exec-server/testing:exec-server",
+    ],
+    # TODO(anp): Reconcile this with codex_rust_crate's integration-test
+    # setup when we add more standalone Divan benchmarks.
+    # `codex_rust_crate` wires CARGO_BIN_EXE_* automatically only for its
+    # generated integration tests. This standalone Divan binary needs the
+    # workspace-root launcher to resolve its runfiles explicitly.
+    runfile_env = {
+        ":codex-app-server": "CARGO_BIN_EXE_codex-app-server",
+        "//codex-rs/exec-server/testing:exec-server": "CARGO_BIN_EXE_exec-server",
+    },
+    tags = ["manual"],
+    test_bin = ":cold-skill-load-bench-bin",
+    visibility = ["//codex-rs:__pkg__"],
+    workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
 )

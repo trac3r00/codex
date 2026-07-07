@@ -3,6 +3,8 @@ name = "codex-app-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# App-server benchmarks are Bazel-only targets rather than Cargo benches.
+autobenches = false
 
 [[bin]]
 name = "codex-app-server"

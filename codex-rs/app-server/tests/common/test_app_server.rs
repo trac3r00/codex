@@ -1863,6 +1863,16 @@ impl TestAppServerBuilder {
         self
     }
 
+    /// Omits debug-only flags that TestAppServer normally passes to app-server.
+    ///
+    /// Optimized Bazel macrobenchmarks use this because their app-server child
+    /// does not expose the debug-only test hooks.
+    pub fn without_debug_only_test_args(mut self) -> Self {
+        self.args
+            .retain(|argument| argument != DISABLE_PLUGIN_STARTUP_TASKS_ARG);
+        self
+    }
+
     /// Adds child-process environment overrides.
     ///
     /// Some values set variables and None values remove inherited variables.
