@@ -15,3 +15,12 @@ filegroup(
     ),
     visibility = ["//visibility:public"],
 )
+
+test_suite(
+    name = "e2e-benchmarks",
+    tags = ["manual"],
+    tests = [
+        "//codex-rs/app-server:cold-skill-load-bench",
+    ],
+    visibility = ["//visibility:public"],
+)
