@@ -290,6 +290,12 @@ mod imp {
         }
     }
 
+    /// Additional time granted when the probe deadline expires while the
+    /// buffer ends with an incomplete primary-device-attributes prefix.
+    /// This avoids leaking the PDA tail into normal TUI input, where the
+    /// leading digit (e.g. `2`) can be misinterpreted as a keypress.
+    const INCOMPLETE_PDA_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
     fn read_startup_probe(
         tty: &mut Tty,
         timeout: Duration,
@@ -316,12 +322,70 @@ mod imp {
             }
             let now = Instant::now();
             if now >= deadline {
-                finish_startup_probe(&mut probe, keyboard_probe, saw_supported_keyboard);
-                return Ok(probe);
+                break;
             }
             if !tty.poll_readable(deadline.saturating_duration_since(now))? {
-                finish_startup_probe(&mut probe, keyboard_probe, saw_supported_keyboard);
-                return Ok(probe);
+                break;
+            }
+        }
+
+        // When the buffer ends with an incomplete PDA response prefix
+        // (ESC [ ? <digits/semicolons> without a final 'c'), the
+        // remaining bytes would leak into normal TUI input.  Grant a
+        // short extension to drain the rest of the response.
+        if has_incomplete_pda_suffix(&buffer) {
+            drain_incomplete_pda(
+                tty,
+                &mut buffer,
+                &mut probe,
+                &mut saw_supported_keyboard,
+                keyboard_probe,
+            )?;
+        }
+
+        finish_startup_probe(&mut probe, keyboard_probe, saw_supported_keyboard);
+        Ok(probe)
+    }
+
+    /// Returns `true` when `buffer` ends with an incomplete primary
+    /// device attributes response: `ESC [ ?` followed by one or more
+    /// digits/semicolons with no terminating `c`.
+    fn has_incomplete_pda_suffix(buffer: &[u8]) -> bool {
+        // Walk backwards from the end to find the last ESC [ ? sequence.
+        // If its payload consists only of digits and semicolons (no 'c'
+        // terminator), the response was split mid-flight.
+        let Some(last_csi_q) = buffer.windows(3).rposition(|w| w == b"\x1B[?") else {
+            return false;
+        };
+        let rest = &buffer[last_csi_q + 3..];
+        // Empty rest after ESC[? is also incomplete.
+        !rest.is_empty() && rest.iter().all(|b| b.is_ascii_digit() || *b == b';')
+    }
+
+    /// Drains an incomplete PDA tail from the terminal, updating the
+    /// probe with any responses that arrive within the extension window.
+    fn drain_incomplete_pda(
+        tty: &mut Tty,
+        buffer: &mut Vec<u8>,
+        probe: &mut StartupProbe,
+        saw_supported_keyboard: &mut bool,
+        keyboard_probe: StartupKeyboardEnhancementProbe,
+    ) -> io::Result<()> {
+        let drain_deadline = Instant::now() + INCOMPLETE_PDA_DRAIN_TIMEOUT;
+        loop {
+            let now = Instant::now();
+            if now >= drain_deadline {
+                return Ok(());
+            }
+            if !tty.poll_readable(drain_deadline.saturating_duration_since(now))? {
+                return Ok(());
+            }
+            tty.read_available(buffer)?;
+            update_startup_probe(probe, saw_supported_keyboard, buffer, keyboard_probe);
+            // Stop as soon as the PDA response is complete (or the
+            // buffer no longer ends with an incomplete prefix).
+            if !has_incomplete_pda_suffix(buffer) {
+                return Ok(());
             }
         }
     }
@@ -559,6 +623,30 @@ mod imp {
                 &probe,
                 StartupKeyboardEnhancementProbe::Query
             ));
+        }
+
+        #[test]
+        fn detects_incomplete_pda_suffix() {
+            // Split PDA: ESC[?61;4;6;7;14;21;2 — missing final 'c'
+            assert!(has_incomplete_pda_suffix(
+                b"\x1B[9;1R\x1B[?61;4;6;7;14;21;2"
+            ));
+            // Just digits after ESC[?
+            assert!(has_incomplete_pda_suffix(b"\x1B[?61"));
+            // Semicolons and digits
+            assert!(has_incomplete_pda_suffix(b"\x1B[?61;4;6"));
+        }
+
+        #[test]
+        fn complete_pda_is_not_incomplete() {
+            // Full PDA response with terminating 'c'
+            assert!(!has_incomplete_pda_suffix(b"\x1B[?61;4;6;7;14;21;22c"));
+            // Keyboard flags response (terminates with 'u', not 'c')
+            assert!(!has_incomplete_pda_suffix(b"\x1B[?7u"));
+            // Empty buffer
+            assert!(!has_incomplete_pda_suffix(b""));
+            // No CSI ? at all
+            assert!(!has_incomplete_pda_suffix(b"hello"));
         }
     }
 }
