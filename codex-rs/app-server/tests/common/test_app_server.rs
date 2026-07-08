@@ -146,8 +146,7 @@ pub struct TestAppServer {
     json_logs: JsonLogCapture,
     codex_home: PathBuf,
     _owned_codex_home: Option<TempDir>,
-    _local_websocket_exec_server: Option<LocalWebsocketExecServer>,
-    _exec_server_delay: Option<WebsocketDelayInterposer>,
+    _delayed_exec_server: Option<(LocalWebsocketExecServer, WebsocketDelayInterposer)>,
 }
 
 pub const DEFAULT_CLIENT_NAME: &str = "codex-app-server-tests";
@@ -165,7 +164,6 @@ impl TestAppServer {
             env_overrides: Vec::new(),
             args: vec![DISABLE_PLUGIN_STARTUP_TASKS_ARG.to_string()],
             exec_server_delay: None,
-            exec_server_program: None,
         }
     }
 
@@ -411,8 +409,7 @@ impl TestAppServer {
             json_logs,
             codex_home: codex_home.to_path_buf(),
             _owned_codex_home: None,
-            _local_websocket_exec_server: None,
-            _exec_server_delay: None,
+            _delayed_exec_server: None,
         })
     }
 
@@ -1822,7 +1819,6 @@ pub struct TestAppServerBuilder {
     env_overrides: Vec<(String, Option<String>)>,
     args: Vec<String>,
     exec_server_delay: Option<Duration>,
-    exec_server_program: Option<PathBuf>,
 }
 
 enum TestAppServerEnvironment {
@@ -1899,13 +1895,6 @@ impl TestAppServerBuilder {
         self
     }
 
-    /// Uses this exec-server binary when fixed RPC delay needs a WebSocket
-    /// transport.
-    pub fn with_exec_server_program(mut self, exec_server_program: &Path) -> Self {
-        self.exec_server_program = Some(exec_server_program.to_path_buf());
-        self
-    }
-
     /// Builds a server with a temporary CODEX_HOME and automatic environment
     /// by default.
     pub async fn build(self) -> anyhow::Result<TestAppServer> {
@@ -1916,7 +1905,6 @@ impl TestAppServerBuilder {
             mut env_overrides,
             args,
             exec_server_delay,
-            exec_server_program,
         } = self;
         let (codex_home, owned_codex_home) = match codex_home {
             Some(codex_home) => (codex_home, None),
@@ -1928,7 +1916,7 @@ impl TestAppServerBuilder {
                 )
             }
         };
-        let (auto_env, local_websocket_exec_server, exec_server_delay) = match environment {
+        let (auto_env, delayed_exec_server) = match environment {
             TestAppServerEnvironment::Auto => {
                 let environments_toml = codex_home.join("environments.toml");
                 ensure!(
@@ -1939,39 +1927,34 @@ impl TestAppServerBuilder {
                     "automatic environment cannot be used when {} exists",
                     environments_toml.display()
                 );
-                let (auto_env, local_websocket_exec_server, exec_server_delay) =
-                    match exec_server_delay {
-                        Some(added_delay) => {
-                            assert!(
-                                !is_remote_test_environment(),
-                                "TestAppServer exec-server delay only supports the local test environment"
-                            );
-                            let exec_server_program = exec_server_program.context(
-                                "TestAppServer exec-server delay requires an exec-server program",
-                            )?;
-                            // Local auto environments normally use stdio. Start a
-                            // host-local WebSocket fixture so the delay interposer has a
-                            // socket stream to wrap.
-                            let local_websocket_exec_server =
-                                LocalWebsocketExecServer::start(&codex_home, &exec_server_program)
-                                    .await?;
-                            let interposer = WebsocketDelayInterposer::start(
-                                local_websocket_exec_server.websocket_url(),
-                                added_delay,
-                            )
-                            .await?;
-                            let auto_env = TestEnv::local_with_exec_server_url(
-                                interposer.websocket_url().to_string(),
-                            )
-                            .await?;
-                            (
-                                auto_env,
-                                Some(local_websocket_exec_server),
-                                Some(interposer),
-                            )
-                        }
-                        None => (test_env().await?, None, None),
-                    };
+                let (auto_env, delayed_exec_server) = match exec_server_delay {
+                    Some(added_delay) => {
+                        ensure!(
+                            !is_remote_test_environment(),
+                            "TestAppServer exec-server delay only supports the local test environment"
+                        );
+                        let exec_server_program =
+                            codex_utils_cargo_bin::cargo_bin("exec-server")
+                                .context("should find binary for delayed exec-server fixture")?;
+                        // Local auto environments normally use stdio. Start a
+                        // host-local WebSocket fixture so the delay interposer has a
+                        // socket stream to wrap.
+                        let local_websocket_exec_server =
+                            LocalWebsocketExecServer::start(&codex_home, &exec_server_program)
+                                .await?;
+                        let interposer = WebsocketDelayInterposer::start(
+                            local_websocket_exec_server.websocket_url(),
+                            added_delay,
+                        )
+                        .await?;
+                        let auto_env = TestEnv::local_with_exec_server_url(
+                            interposer.websocket_url().to_string(),
+                        )
+                        .await?;
+                        (auto_env, Some((local_websocket_exec_server, interposer)))
+                    }
+                    None => (test_env().await?, None),
+                };
                 // Noise registry configuration takes precedence over the URL-based
                 // provider, so clear inherited values to keep the selection hermetic.
                 let mut auto_env_overrides = vec![
@@ -1995,18 +1978,14 @@ impl TestAppServerBuilder {
                 ];
                 auto_env_overrides.append(&mut env_overrides);
                 env_overrides = auto_env_overrides;
-                (
-                    Some(auto_env),
-                    local_websocket_exec_server,
-                    exec_server_delay,
-                )
+                (Some(auto_env), delayed_exec_server)
             }
             TestAppServerEnvironment::None => {
                 ensure!(
                     exec_server_delay.is_none(),
                     "exec-server delay requires the automatic test environment"
                 );
-                (None, None, None)
+                (None, None)
             }
         };
         let program = match program {
@@ -2028,8 +2007,7 @@ impl TestAppServerBuilder {
         .await?;
         app_server.auto_env = auto_env;
         app_server._owned_codex_home = owned_codex_home;
-        app_server._local_websocket_exec_server = local_websocket_exec_server;
-        app_server._exec_server_delay = exec_server_delay;
+        app_server._delayed_exec_server = delayed_exec_server;
         Ok(app_server)
     }
 }
