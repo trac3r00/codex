@@ -169,6 +169,8 @@ async fn install_latest_standalone() -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .env_remove("CODEX_INSTALL_DIR")
+        .env_remove("CODEX_HOME")
         .spawn()
         .context("failed to invoke standalone Codex updater")?;
     let mut stdin = child

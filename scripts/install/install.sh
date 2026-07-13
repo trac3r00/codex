@@ -16,6 +16,23 @@ LOCK_FILE="$STANDALONE_ROOT/install.lock"
 LOCK_DIR="$STANDALONE_ROOT/install.lock.d"
 LOCK_STALE_AFTER_SECS=600
 
+# Ensure CODEX_INSTALL_DIR is not set inside the managed standalone tree, so
+# the visible command symlink does not become self-referential.
+validate_install_dir() {
+  case "$BIN_DIR" in
+    "$CURRENT_LINK"/* | "$CURRENT_LINK")
+      echo "Refusing to install: CODEX_INSTALL_DIR must not point inside the managed standalone directory ($CURRENT_LINK)." >&2
+      echo "Unset CODEX_INSTALL_DIR or choose a directory outside $STANDALONE_ROOT, such as $HOME/.local/bin." >&2
+      exit 1
+      ;;
+    "$STANDALONE_ROOT"/* | "$STANDALONE_ROOT")
+      echo "Refusing to install: CODEX_INSTALL_DIR must not point inside the managed standalone directory ($STANDALONE_ROOT)." >&2
+      echo "Unset CODEX_INSTALL_DIR or choose a directory outside $STANDALONE_ROOT, such as $HOME/.local/bin." >&2
+      exit 1
+      ;;
+  esac
+}
+
 path_action="already"
 path_profile=""
 conflict_manager=""
@@ -991,6 +1008,7 @@ trap cleanup EXIT INT TERM
 
 acquire_install_lock
 cleanup_stale_install_artifacts
+validate_install_dir
 
 if ! release_dir_is_complete "$release_dir" "$resolved_version" "$vendor_target" "$install_layout"; then
   if [ -e "$release_dir" ] || [ -L "$release_dir" ]; then

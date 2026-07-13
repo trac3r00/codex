@@ -114,6 +114,74 @@ class InstallShTest(unittest.TestCase):
             )
             self.assertTrue(os.access(host_path, os.X_OK))
 
+    def test_install_dir_inside_standalone_current_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive_path, checksum_path, metadata_json = create_package_release(root)
+            bad_install_dir = (
+                root / "codex-home" / "packages" / "standalone" / "current" / "bin"
+            )
+            bad_install_dir.mkdir(parents=True)
+
+            result, _requests = run_installer_in(
+                root,
+                VERSION,
+                metadata_json=metadata_json,
+                archive_path=archive_path,
+                checksum_path=checksum_path,
+                install_dir=bad_install_dir,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Refusing to install", result.stderr)
+            self.assertIn(
+                str(root / "codex-home" / "packages" / "standalone" / "current"),
+                result.stderr,
+            )
+
+    def test_install_dir_inside_standalone_root_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive_path, checksum_path, metadata_json = create_package_release(root)
+            bad_install_dir = root / "codex-home" / "packages" / "standalone" / "bad-bin"
+            bad_install_dir.mkdir(parents=True)
+
+            result, _requests = run_installer_in(
+                root,
+                VERSION,
+                metadata_json=metadata_json,
+                archive_path=archive_path,
+                checksum_path=checksum_path,
+                install_dir=bad_install_dir,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Refusing to install", result.stderr)
+            self.assertIn(
+                str(root / "codex-home" / "packages" / "standalone"),
+                result.stderr,
+            )
+
+    def test_install_dir_outside_standalone_tree_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive_path, checksum_path, metadata_json = create_package_release(root)
+            install_dir = root / "external-bin"
+            install_dir.mkdir()
+
+            result, _requests = run_installer_in(
+                root,
+                VERSION,
+                metadata_json=metadata_json,
+                archive_path=archive_path,
+                checksum_path=checksum_path,
+                install_dir=install_dir,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            codex_path = install_dir / "codex"
+            self.assertTrue(codex_path.is_symlink())
+
 
 def run_installer(
     release: str,
@@ -139,6 +207,7 @@ def run_installer_in(
     archive_path: Path | None = None,
     checksum_path: Path | None = None,
     force_macos: bool = False,
+    install_dir: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     bin_dir = root / "bin"
     bin_dir.mkdir()
@@ -160,7 +229,7 @@ def run_installer_in(
               fi
               previous="$arg"
             done
-            printf '%s\n' "$url" >>"$CODEX_TEST_REQUEST_LOG"
+            printf '%s\\n' "$url" >>"$CODEX_TEST_REQUEST_LOG"
 
             case "$url" in
               https://api.github.com/*)
@@ -168,7 +237,7 @@ def run_installer_in(
                   echo "curl: (22) The requested URL returned error: 403" >&2
                   exit 22
                 fi
-                printf '%s\n' "$CODEX_TEST_METADATA_JSON"
+                printf '%s\\n' "$CODEX_TEST_METADATA_JSON"
                 ;;
               */codex-package_SHA256SUMS)
                 if [ -n "$CODEX_TEST_CHECKSUM_PATH" ]; then
@@ -211,7 +280,7 @@ def run_installer_in(
     env.update(
         {
             "CODEX_HOME": str(root / "codex-home"),
-            "CODEX_INSTALL_DIR": str(root / "install-bin"),
+            "CODEX_INSTALL_DIR": str(install_dir or (root / "install-bin")),
             "CODEX_NON_INTERACTIVE": "1",
             "CODEX_RELEASE": release,
             "CODEX_TEST_ARCHIVE_PATH": str(archive_path or ""),
