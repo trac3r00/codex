@@ -143,7 +143,9 @@ class InstallShTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             archive_path, checksum_path, metadata_json = create_package_release(root)
-            bad_install_dir = root / "codex-home" / "packages" / "standalone" / "bad-bin"
+            bad_install_dir = (
+                root / "codex-home" / "packages" / "standalone" / "bad-bin"
+            )
             bad_install_dir.mkdir(parents=True)
 
             result, _requests = run_installer_in(
